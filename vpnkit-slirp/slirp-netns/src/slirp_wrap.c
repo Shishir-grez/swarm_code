@@ -6,14 +6,8 @@
 #include <poll.h>
 #include <time.h>
 #include <arpa/inet.h>
-#include <glib.h>
 #include <slirp/libslirp.h>
 #include "slirp_wrap.h"
-
-typedef struct {
-    SlirpTimerId id;
-    void *cb_opaque;
-} timer_data_t;
 
 static ssize_t cb_send_packet(const void *buf, size_t len, void *opaque)
 {
@@ -37,17 +31,13 @@ static int64_t cb_clock_get_ns(void *opaque)
 
 static void *cb_timer_new(SlirpTimerId id, void *cb_opaque, void *opaque)
 {
-    (void)opaque;
-    timer_data_t *t = calloc(1, sizeof(*t));
-    t->id = id;
-    t->cb_opaque = cb_opaque;
-    return t;
+    (void)id; (void)cb_opaque; (void)opaque;
+    return NULL;
 }
 
 static void cb_timer_free(void *timer, void *opaque)
 {
-    (void)opaque;
-    free(timer);
+    (void)timer; (void)opaque;
 }
 
 static void cb_timer_mod(void *timer, int64_t expire_time, void *opaque)
@@ -64,7 +54,7 @@ static SlirpCb slirp_callbacks = {
     .send_packet       = cb_send_packet,
     .guest_error       = cb_guest_error,
     .clock_get_ns      = cb_clock_get_ns,
-    .timer_new         = (void *)cb_timer_new,
+    .timer_new         = cb_timer_new,
     .timer_free        = cb_timer_free,
     .timer_mod         = cb_timer_mod,
     .notify            = cb_notify,
@@ -97,46 +87,39 @@ int slirp_ctx_init(slirp_ctx_t *ctx, int tap_fd)
     return 0;
 }
 
-static GPollFD g_pollfds[256];
-static int g_pollfds_count = 0;
-static int g_pollfds_capacity = 256;
-
-static int add_poll_cb(int fd, int events, void *opaque)
-{
-    (void)opaque;
-    if (g_pollfds_count >= g_pollfds_capacity) return -1;
-    g_pollfds[g_pollfds_count].fd = fd;
-    g_pollfds[g_pollfds_count].events = events;
-    g_pollfds[g_pollfds_count].revents = 0;
-    return g_pollfds_count++;
-}
-
-static int get_revents_cb(int idx, void *opaque)
-{
-    (void)opaque;
-    if (idx < 0 || idx >= g_pollfds_count) return 0;
-    return g_pollfds[idx].revents;
-}
-
 void slirp_ctx_run(slirp_ctx_t *ctx)
 {
     uint8_t buf[65536];
+    struct pollfd pollfds[256];
+    SlirpPollfdsIterator *iterator;
+    int poll_count;
+    int ret;
 
     while (ctx->running) {
-        uint32_t timeout_ms = 0;
-        g_pollfds_count = 0;
+        poll_count = 0;
 
-        slirp_pollfds_fill(ctx->slirp, &timeout_ms, add_poll_cb, NULL);
-
-        int tap_idx = g_pollfds_count;
-        if (g_pollfds_count < g_pollfds_capacity) {
-            g_pollfds[g_pollfds_count].fd = ctx->tap_fd;
-            g_pollfds[g_pollfds_count].events = POLLIN;
-            g_pollfds[g_pollfds_count].revents = 0;
-            g_pollfds_count++;
+        slirp_pollfds_fill(ctx->slirp, &iterator);
+        if (iterator) {
+            SlirpPollfd pollfd;
+            while (slirp_pollfds_next(ctx->slirp, iterator, &pollfd)) {
+                if (poll_count < 255) {
+                    pollfds[poll_count].fd = pollfd.fd;
+                    pollfds[poll_count].events = pollfd.events;
+                    pollfds[poll_count].revents = 0;
+                    poll_count++;
+                }
+            }
         }
 
-        int ret = g_poll(g_pollfds, g_pollfds_count, timeout_ms ? timeout_ms : 100);
+        int tap_idx = poll_count;
+        if (poll_count < 256) {
+            pollfds[poll_count].fd = ctx->tap_fd;
+            pollfds[poll_count].events = POLLIN;
+            pollfds[poll_count].revents = 0;
+            poll_count++;
+        }
+
+        ret = poll(pollfds, poll_count, 100);
 
         if (ret < 0) {
             if (errno == EINTR) continue;
@@ -144,14 +127,14 @@ void slirp_ctx_run(slirp_ctx_t *ctx)
             break;
         }
 
-        if (tap_idx < g_pollfds_count && (g_pollfds[tap_idx].revents & POLLIN)) {
+        if (tap_idx < poll_count && (pollfds[tap_idx].revents & POLLIN)) {
             ssize_t n = read(ctx->tap_fd, buf, sizeof(buf));
             if (n > 0) {
                 slirp_input(ctx->slirp, buf, (int)n);
             }
         }
 
-        slirp_pollfds_poll(ctx->slirp, ret < 0, get_revents_cb, NULL);
+        slirp_pollfds_poll(ctx->slirp, iterator, ret < 0 ? SLIRP_POLL_ERR : 0);
     }
 }
 
