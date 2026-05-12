@@ -2,6 +2,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <linux/if_ether.h>
+#include <netinet/ip.h>
 #include "arp.h"
 
 const uint8_t GATEWAY_MAC[6] = {0xCA, 0xFE, 0x00, 0x00, 0x00, 0x01};

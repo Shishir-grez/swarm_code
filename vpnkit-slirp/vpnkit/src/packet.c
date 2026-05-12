@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <linux/if_ether.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include "packet.h"
 #include "arp.h"
 
@@ -100,7 +103,7 @@ size_t build_tcp_frame(
     tcp->ack = (flags & TH_ACK) ? 1 : 0;
     tcp->fin = (flags & TH_FIN) ? 1 : 0;
     tcp->rst = (flags & TH_RST) ? 1 : 0;
-    tcp->psh = (flags & TH_PSH) ? 1 : 0;
+    tcp->psh = (flags & TH_PUSH) ? 1 : 0;
     tcp->window = htons(65535);
 
     if (flags & TH_SYN) {

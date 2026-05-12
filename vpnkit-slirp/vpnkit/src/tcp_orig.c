@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <linux/if_ether.h>
 #include "conn.h"
@@ -171,7 +172,7 @@ void tcp_poll_host(conn_table_t *ct, ring_t *tx_ring)
         ssize_t n = recv(c->host_fd, buf, sizeof(buf), MSG_DONTWAIT);
 
         if (n > 0) {
-            send_to_guest(tx_ring, c, TH_ACK | TH_PSH, buf, (size_t)n);
+            send_to_guest(tx_ring, c, TH_ACK | TH_PUSH, buf, (size_t)n);
             c->snd_nxt += (uint32_t)n;
             c->last_active = time(NULL);
         }

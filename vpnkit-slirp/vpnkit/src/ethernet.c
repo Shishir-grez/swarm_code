@@ -2,6 +2,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <linux/if_ether.h>
+#include <netinet/ip.h>
 #include "ethernet.h"
 
 int eth_parse(const uint8_t *frame, size_t frame_len,
@@ -13,7 +14,7 @@ int eth_parse(const uint8_t *frame, size_t frame_len,
     const struct ethhdr *eth = (const struct ethhdr *)frame;
     *ether_type = (uint8_t *)&eth->h_proto;
     *payload = (uint8_t *)(frame + sizeof(struct ethhdr));
-    *payload_len = frame_len - sizeof(struct ethhdr));
+    *payload_len = frame_len - sizeof(struct ethhdr);
 
     return 0;
 }
