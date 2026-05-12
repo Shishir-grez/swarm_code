@@ -30,35 +30,10 @@ static int64_t cb_clock_get_ns(void *opaque)
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-static void *cb_timer_new(SlirpTimerId id, void *cb_opaque, void *opaque)
-{
-    (void)id; (void)cb_opaque; (void)opaque;
-    return NULL;
-}
-
-static void cb_timer_free(void *timer, void *opaque)
-{
-    (void)timer; (void)opaque;
-}
-
-static void cb_timer_mod(void *timer, int64_t expire_time, void *opaque)
-{
-    (void)timer; (void)expire_time; (void)opaque;
-}
-
-static void cb_notify(void *opaque)
-{
-    (void)opaque;
-}
-
 static SlirpCb slirp_callbacks = {
     .send_packet       = cb_send_packet,
     .guest_error       = cb_guest_error,
     .clock_get_ns      = cb_clock_get_ns,
-    .timer_new         = (SlirpTimerNew *)cb_timer_new,
-    .timer_free        = cb_timer_free,
-    .timer_mod         = cb_timer_mod,
-    .notify            = cb_notify,
 };
 
 int slirp_ctx_init(slirp_ctx_t *ctx, int tap_fd)
