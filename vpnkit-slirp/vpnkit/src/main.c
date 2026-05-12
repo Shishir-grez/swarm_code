@@ -85,8 +85,8 @@ int main(int argc, char *argv[])
                     uint8_t reply[128];
                     int rlen = arp_handle(frame, n, reply, sizeof(reply));
                     if (rlen > 0) {
-                        ring_write(&g_tx_ring, reply, (uint16_t)rlen);
-                        ring_notify(&g_tx_ring);
+                        ring_write(&g_rx_ring, reply, (uint16_t)rlen);
+                        ring_notify(&g_rx_ring);
                     }
                 }
                 else if (type == 0x0800) {
