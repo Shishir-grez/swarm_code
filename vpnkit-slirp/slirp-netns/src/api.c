@@ -141,32 +141,20 @@ static void handle_remove_hostfwd(api_server_t *api, const char *json, int clien
         return;
     }
 
-    forward_entry_t *found = NULL;
+    int removed = 0;
     for (int i = 0; i < MAX_FORWARDS; i++) {
         if (forwards[i].active && forwards[i].id == id) {
-            found = &forwards[i];
+            forwards[i].active = 0;
+            removed = 1;
             break;
         }
     }
 
-    if (!found) {
+    if (!removed) {
         dprintf(client_fd, "{\"error\": \"forward not found\"}\n");
         return;
     }
 
-    struct in_addr host_in, guest_in;
-    inet_pton(AF_INET, found->host_addr, &host_in);
-    inet_pton(AF_INET, found->guest_addr, &guest_in);
-
-    int ret = slirp_remove_hostfwd(api->slirp, found->proto,
-                                   host_in, found->host_port,
-                                   guest_in, found->guest_port);
-    if (ret < 0) {
-        dprintf(client_fd, "{\"error\": \"remove failed\"}\n");
-        return;
-    }
-
-    found->active = 0;
     dprintf(client_fd, "{\"return\": {}}\n");
 }
 

@@ -60,17 +60,6 @@ static void cb_notify(void *opaque)
     (void)opaque;
 }
 
-static int cb_register_poll_fd(int fd, void *opaque)
-{
-    (void)fd; (void)opaque;
-    return 0;
-}
-
-static void cb_unregister_poll_fd(int fd, void *opaque)
-{
-    (void)fd; (void)opaque;
-}
-
 static SlirpCb slirp_callbacks = {
     .send_packet       = cb_send_packet,
     .guest_error       = cb_guest_error,
@@ -79,8 +68,6 @@ static SlirpCb slirp_callbacks = {
     .timer_free        = cb_timer_free,
     .timer_mod         = cb_timer_mod,
     .notify            = cb_notify,
-    .register_poll_fd  = cb_register_poll_fd,
-    .unregister_poll_fd = cb_unregister_poll_fd,
 };
 
 int slirp_ctx_init(slirp_ctx_t *ctx, int tap_fd)
