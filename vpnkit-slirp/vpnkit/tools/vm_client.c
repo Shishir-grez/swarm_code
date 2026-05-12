@@ -68,8 +68,8 @@ int main(int argc, char *argv[])
 
     printf("VM client starting...\n");
 
-    ring_create(&g_rx_ring, "/vpnkit-rx");
-    ring_attach(&g_tx_ring, "/vpnkit-tx", -1);
+ring_attach(&g_rx_ring, "/vpnkit-rx", -1);
+ring_attach(&g_tx_ring, "/vpnkit-tx", -1);
 
     uint8_t src_mac[6] = {0x02, rand()&0xFF, rand()&0xFF, rand()&0xFF, rand()&0xFF, 1};
     uint32_t src_ip = (10 << 24) | (0 << 16) | (2 << 8) | (100);
