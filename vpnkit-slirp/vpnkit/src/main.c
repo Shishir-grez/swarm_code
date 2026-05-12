@@ -112,12 +112,32 @@ static int wait_for_client(int *client_fd_out, int rx_efd, int tx_efd,
     printf("Server: rx_ring eventfd=%d, tx_ring eventfd=%d\n",
            ring_event_fd(&g_rx_ring), ring_event_fd(&g_tx_ring));
 
-    // Send eventfds and shm names to client
-    // Protocol: [rx_efd][tx_efd][rx_path_len][rx_path][tx_path_len][tx_path]
-    if (send_fd(client_fd, rx_efd) < 0) { perror("send_fd rx"); return -1; }
-    if (send_fd(client_fd, tx_efd) < 0) { perror("send_fd tx"); return -1; }
+    // Send eventfds atomically in one message, then shm names
+    // This avoids race conditions with separate sendmsg calls
+    struct msghdr msg = {0};
+    struct iovec iov;
+    char cmsg_buf[CMSG_SPACE(2 * sizeof(int))];
+    char dummy = '!';
 
-    // Send shm names as strings so client can attach
+    iov.iov_base = &dummy;
+    iov.iov_len = 1;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    struct cmsghdr *cmsg = (struct cmsghdr *)cmsg_buf;
+    cmsg->cmsg_len = CMSG_LEN(2 * sizeof(int));
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    int *fds = (int *)CMSG_DATA(cmsg);
+    fds[0] = rx_efd;
+    fds[1] = tx_efd;
+
+    msg.msg_control = cmsg;
+    msg.msg_controllen = cmsg->cmsg_len;
+
+    if (sendmsg(client_fd, &msg, 0) < 0) { perror("sendmsg fds"); return -1; }
+
+    // Send shm names as strings
     uint32_t rx_len = (uint32_t)strlen(rx_shm);
     uint32_t tx_len = (uint32_t)strlen(tx_shm);
     if (write(client_fd, &rx_len, 4) != 4 ||

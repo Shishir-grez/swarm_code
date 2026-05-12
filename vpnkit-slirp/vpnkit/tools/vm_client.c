@@ -16,12 +16,12 @@ static const uint8_t GATEWAY_IP[4] = {10, 0, 2, 2};
 static ring_t g_rx_ring;
 static ring_t g_tx_ring;
 
-// Receive a file descriptor via Unix socket using SCM_RIGHTS
-static int recv_fd(int sock)
+// Receive two file descriptors via Unix socket using SCM_RIGHTS
+static int recv_fds(int sock, int *fd1, int *fd2)
 {
     struct msghdr msg = {0};
     struct iovec iov;
-    char buf[CMSG_SPACE(sizeof(int))];
+    char buf[CMSG_SPACE(2 * sizeof(int))];
     char dummy;
 
     iov.iov_base = &dummy;
@@ -36,8 +36,12 @@ static int recv_fd(int sock)
         return -1;
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS)
-        return *(int *)CMSG_DATA(cmsg);
+    if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+        int *fds = (int *)CMSG_DATA(cmsg);
+        *fd1 = fds[0];
+        *fd2 = fds[1];
+        return 0;
+    }
 
     return -1;
 }
@@ -123,9 +127,8 @@ int main(int argc, char *argv[])
     printf("Connected to mini-vpnkit\n");
 
     // Receive eventfds from server via SCM_RIGHTS
-    int rx_efd = recv_fd(sock);
-    int tx_efd = recv_fd(sock);
-    if (rx_efd < 0 || tx_efd < 0) {
+    int rx_efd, tx_efd;
+    if (recv_fds(sock, &rx_efd, &tx_efd) < 0) {
         fprintf(stderr, "Failed to receive eventfds\n");
         return 1;
     }
