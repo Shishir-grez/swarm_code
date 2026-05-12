@@ -8,6 +8,7 @@
 #include <time.h>
 #include <linux/if_ether.h>
 #include "ring.h"
+#include "arp.h"
 
 static ring_t g_rx_ring;
 static ring_t g_tx_ring;
