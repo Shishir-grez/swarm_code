@@ -24,6 +24,7 @@ typedef struct {
 
 int ring_create(ring_t *ring, const char *shm_name);
 int ring_attach(ring_t *ring, const char *shm_name, int event_fd);
+int ring_set_eventfd(ring_t *ring, int event_fd);  // set eventfd after attach
 int ring_write(ring_t *ring, const uint8_t *frame, uint16_t frame_len);
 int ring_read(ring_t *ring, uint8_t *buf, size_t buf_len);
 int ring_event_fd(ring_t *ring);

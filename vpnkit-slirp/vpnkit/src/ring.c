@@ -113,6 +113,13 @@ int ring_read(ring_t *ring, uint8_t *buf, size_t buf_len)
 
 int ring_event_fd(ring_t *ring) { return ring->event_fd; }
 
+int ring_set_eventfd(ring_t *ring, int event_fd)
+{
+    if (ring->event_fd >= 0) close(ring->event_fd);
+    ring->event_fd = event_fd;
+    return 0;
+}
+
 void ring_notify(ring_t *ring)
 {
     uint64_t val = 1;
