@@ -10,6 +10,11 @@
 #include <slirp/libslirp.h>
 #include "slirp_wrap.h"
 
+typedef struct {
+    SlirpTimerId id;
+    void *cb_opaque;
+} timer_data_t;
+
 static ssize_t cb_send_packet(const void *buf, size_t len, void *opaque)
 {
     slirp_ctx_t *ctx = (slirp_ctx_t *)opaque;
@@ -33,7 +38,7 @@ static int64_t cb_clock_get_ns(void *opaque)
 static void *cb_timer_new(SlirpTimerId id, void *cb_opaque, void *opaque)
 {
     (void)opaque;
-    SlirpTimer *t = g_new0(SlirpTimer, 1);
+    timer_data_t *t = calloc(1, sizeof(*t));
     t->id = id;
     t->cb_opaque = cb_opaque;
     return t;
@@ -42,7 +47,7 @@ static void *cb_timer_new(SlirpTimerId id, void *cb_opaque, void *opaque)
 static void cb_timer_free(void *timer, void *opaque)
 {
     (void)opaque;
-    g_free(timer);
+    free(timer);
 }
 
 static void cb_timer_mod(void *timer, int64_t expire_time, void *opaque)
@@ -70,11 +75,11 @@ static SlirpCb slirp_callbacks = {
     .send_packet       = cb_send_packet,
     .guest_error       = cb_guest_error,
     .clock_get_ns      = cb_clock_get_ns,
-    .timer_new        = cb_timer_new,
-    .timer_free       = cb_timer_free,
-    .timer_mod       = cb_timer_mod,
-    .notify          = cb_notify,
-    .register_poll_fd = cb_register_poll_fd,
+    .timer_new         = cb_timer_new,
+    .timer_free        = cb_timer_free,
+    .timer_mod         = cb_timer_mod,
+    .notify            = cb_notify,
+    .register_poll_fd  = cb_register_poll_fd,
     .unregister_poll_fd = cb_unregister_poll_fd,
 };
 
@@ -105,39 +110,46 @@ int slirp_ctx_init(slirp_ctx_t *ctx, int tap_fd)
     return 0;
 }
 
+static GPollFD g_pollfds[256];
+static int g_pollfds_count = 0;
+static int g_pollfds_capacity = 256;
+
+static int add_poll_cb(int fd, int events, void *opaque)
+{
+    (void)opaque;
+    if (g_pollfds_count >= g_pollfds_capacity) return -1;
+    g_pollfds[g_pollfds_count].fd = fd;
+    g_pollfds[g_pollfds_count].events = events;
+    g_pollfds[g_pollfds_count].revents = 0;
+    return g_pollfds_count++;
+}
+
+static int get_revents_cb(int idx, void *opaque)
+{
+    (void)opaque;
+    if (idx < 0 || idx >= g_pollfds_count) return 0;
+    return g_pollfds[idx].revents;
+}
+
 void slirp_ctx_run(slirp_ctx_t *ctx)
 {
     uint8_t buf[65536];
 
     while (ctx->running) {
         uint32_t timeout_ms = 0;
+        g_pollfds_count = 0;
 
-        GPollFD pollfds[256];
-        int pollfds_count = 0;
-        int pollfds_capacity = 256;
+        slirp_pollfds_fill(ctx->slirp, &timeout_ms, add_poll_cb, NULL);
 
-        slirp_pollfds_fill(ctx->slirp, &timeout_ms,
-            (SlirpAddPollFD)^(int fd, int events, void *opaque) {
-                (void)opaque;
-                if (pollfds_count < pollfds_capacity) {
-                    pollfds[pollfds_count].fd = fd;
-                    pollfds[pollfds_count].events = events;
-                    pollfds[pollfds_count].revents = 0;
-                    return pollfds_count++;
-                }
-                return -1;
-            }, NULL);
-
-        int tap_idx = pollfds_count;
-        if (pollfds_count < pollfds_capacity) {
-            pollfds[pollfds_count].fd = ctx->tap_fd;
-            pollfds[pollfds_count].events = POLLIN;
-            pollfds[pollfds_count].revents = 0;
-            pollfds_count++;
+        int tap_idx = g_pollfds_count;
+        if (g_pollfds_count < g_pollfds_capacity) {
+            g_pollfds[g_pollfds_count].fd = ctx->tap_fd;
+            g_pollfds[g_pollfds_count].events = POLLIN;
+            g_pollfds[g_pollfds_count].revents = 0;
+            g_pollfds_count++;
         }
 
-        int ret = g_poll((GPollFD *)pollfds, pollfds_count,
-                        timeout_ms ? timeout_ms : 100);
+        int ret = g_poll(g_pollfds, g_pollfds_count, timeout_ms ? timeout_ms : 100);
 
         if (ret < 0) {
             if (errno == EINTR) continue;
@@ -145,19 +157,14 @@ void slirp_ctx_run(slirp_ctx_t *ctx)
             break;
         }
 
-        if (pollfds[tap_idx].revents & POLLIN) {
+        if (tap_idx < g_pollfds_count && (g_pollfds[tap_idx].revents & POLLIN)) {
             ssize_t n = read(ctx->tap_fd, buf, sizeof(buf));
             if (n > 0) {
                 slirp_input(ctx->slirp, buf, (int)n);
             }
         }
 
-        slirp_pollfds_poll(ctx->slifter, ret < 0,
-            (SlirpGetRevents)^(int idx, void *opaque) {
-                (void)opaque;
-                if (idx < 0 || idx >= pollfds_count) return 0;
-                return pollfds[idx].revents;
-            }, NULL);
+        slirp_pollfds_poll(ctx->slirp, ret < 0, get_revents_cb, NULL);
     }
 }
 

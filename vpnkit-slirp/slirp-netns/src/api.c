@@ -23,7 +23,6 @@ typedef struct {
 } forward_entry_t;
 
 static forward_entry_t forwards[MAX_FORWARDS];
-static int next_id = 1;
 
 int api_server_init(api_server_t *api, const char *socket_path, Slirp *slirp)
 {
@@ -142,19 +141,32 @@ static void handle_remove_hostfwd(api_server_t *api, const char *json, int clien
         return;
     }
 
-    int ret = slirp_remove_hostfwd(api->slirp, id);
+    forward_entry_t *found = NULL;
+    for (int i = 0; i < MAX_FORWARDS; i++) {
+        if (forwards[i].active && forwards[i].id == id) {
+            found = &forwards[i];
+            break;
+        }
+    }
+
+    if (!found) {
+        dprintf(client_fd, "{\"error\": \"forward not found\"}\n");
+        return;
+    }
+
+    struct in_addr host_in, guest_in;
+    inet_pton(AF_INET, found->host_addr, &host_in);
+    inet_pton(AF_INET, found->guest_addr, &guest_in);
+
+    int ret = slirp_remove_hostfwd(api->slirp, found->proto,
+                                   host_in, found->host_port,
+                                   guest_in, found->guest_port);
     if (ret < 0) {
         dprintf(client_fd, "{\"error\": \"remove failed\"}\n");
         return;
     }
 
-    for (int i = 0; i < MAX_FORWARDS; i++) {
-        if (forwards[i].active && forwards[i].id == id) {
-            forwards[i].active = 0;
-            break;
-        }
-    }
-
+    found->active = 0;
     dprintf(client_fd, "{\"return\": {}}\n");
 }
 
