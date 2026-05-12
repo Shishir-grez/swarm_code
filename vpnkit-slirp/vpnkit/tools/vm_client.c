@@ -8,7 +8,8 @@
 #include <time.h>
 #include <linux/if_ether.h>
 #include "ring.h"
-#include "arp.h"
+
+static const uint8_t GATEWAY_IP[4] = {10, 0, 2, 2};
 
 static ring_t g_rx_ring;
 static ring_t g_tx_ring;
