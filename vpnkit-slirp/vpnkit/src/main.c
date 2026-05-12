@@ -108,6 +108,10 @@ static int wait_for_client(int *client_fd_out, int rx_efd, int tx_efd,
     close(listen_fd);
     unlink(sock_path);
 
+    // Debug: show eventfds before sending
+    printf("Server: rx_ring eventfd=%d, tx_ring eventfd=%d\n",
+           ring_event_fd(&g_rx_ring), ring_event_fd(&g_tx_ring));
+
     // Send eventfds and shm names to client
     // Protocol: [rx_efd][tx_efd][rx_path_len][rx_path][tx_path_len][tx_path]
     if (send_fd(client_fd, rx_efd) < 0) { perror("send_fd rx"); return -1; }

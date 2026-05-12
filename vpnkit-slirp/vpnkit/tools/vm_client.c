@@ -148,10 +148,21 @@ int main(int argc, char *argv[])
     close(sock); // No longer needed after receiving everything
 
     // Attach to shared memory rings with the server's eventfds
-    // vm_client READS from rx_ring (= /vpnkit-tx, where server writes replies)
-    // vm_client WRITES to tx_ring (= /vpnkit-rx, where server reads requests)
-    ring_attach(&g_rx_ring, tx_shm, rx_efd);  // read server replies here
-    ring_attach(&g_tx_ring, rx_shm, tx_efd);  // write requests here
+    // Direction convention:
+    //   rx_shm = /vpnkit-rx: server READS from here (client WRITES here = g_tx_ring)
+    //   tx_shm = /vpnkit-tx: server WRITES to here (client READS here = g_rx_ring)
+    // Eventfd naming from server's perspective:
+    //   rx_shm comes with rx_efd (server polls this for incoming data)
+    //   tx_shm comes with tx_efd (server polls this for outgoing data)
+    // Client writes to rx_shm and notifies via rx_efd → server wakes up
+    // Client reads from tx_shm and notifies via tx_efd → server wakes up
+    ring_attach(&g_tx_ring, rx_shm, rx_efd);  // write requests → notify rx_efd
+    ring_attach(&g_rx_ring, tx_shm, tx_efd);  // read replies → notify tx_efd
+
+    printf("Client: g_tx_ring eventfd=%d (should be rx_efd=%d, /vpnkit-rx notifier)\n",
+           ring_event_fd(&g_tx_ring), rx_efd);
+    printf("Client: g_rx_ring eventfd=%d (should be tx_efd=%d, /vpnkit-tx notifier)\n",
+           ring_event_fd(&g_rx_ring), tx_efd);
 
     uint8_t src_mac[6] = {0x02, rand()&0xFF, rand()&0xFF, rand()&0xFF, rand()&0xFF, 1};
     uint32_t src_ip = (10 << 24) | (0 << 16) | (2 << 8) | (100);
@@ -160,7 +171,7 @@ int main(int argc, char *argv[])
     send_arp_request(frame, src_mac, (uint8_t *)GATEWAY_IP);
     ring_write(&g_tx_ring, frame, 60);
     ring_notify(&g_tx_ring);
-    printf("Sent ARP request (notified via eventfd %d)\n", tx_efd);
+    printf("Sent ARP request to ring %p (notified via eventfd %d)\n", (void*)&g_tx_ring, g_tx_ring.event_fd);
 
     usleep(100000);
 
