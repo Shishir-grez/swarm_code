@@ -17,29 +17,10 @@ static const uint8_t GATEWAY_IP[4] = {10, 0, 2, 2};
 static ring_t g_rx_ring;
 static ring_t g_tx_ring;
 
-/*
- * Ring direction map:
- *   /vpnkit-rx: server READS here, client WRITES here (g_tx_ring)
- *   /vpnkit-tx: server WRITES here, client READS here (g_rx_ring)
- *
- * Server sends FDs one at a time:
- *   FD #1 = rx ring's eventfd (used by client when writing to rx ring)
- *   FD #2 = tx ring's eventfd (used by server when writing to tx ring)
- *
- * Client receives them in same order and attaches accordingly.
- */
-
-/* Receive one FD from server via SCM_RIGHTS on a connected Unix socket */
 static int recv_one_fd(int sock)
 {
     char dummy;
     struct iovec iov = { .iov_base = &dummy, .iov_len = 1 };
-
-    /*
-     * Use CMSG_SPACE(sizeof(int)*2) for buffer to handle kernel
-     * alignment padding — some kernels use 16-byte alignment for
-     * the cmsg buffer even for a single int.
-     */
     char cbuf[CMSG_SPACE(sizeof(int) * 2)];
     struct msghdr msg = {0};
     msg.msg_iov = &iov;
@@ -47,19 +28,47 @@ static int recv_one_fd(int sock)
     msg.msg_control = cbuf;
     msg.msg_controllen = sizeof(cbuf);
 
-    if (recvmsg(sock, &msg, 0) < 0) {
-        perror("recvmsg");
-        return -1;
-    }
+    if (recvmsg(sock, &msg, 0) < 0) { perror("recvmsg"); return -1; }
 
     struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
     if (!cm || cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) {
-        fprintf(stderr, "ERROR: no SCM_RIGHTS in message\n");
+        fprintf(stderr, "ERROR: no SCM_RIGHTS\n");
         return -1;
     }
+    return *(int *)CMSG_DATA(cm);
+}
 
-    int *fds = (int *)CMSG_DATA(cm);
-    return fds[0];
+static uint16_t checksum16(const void *data, size_t len)
+{
+    const uint16_t *p = (const uint16_t *)data;
+    uint32_t sum = 0;
+    while (len > 1) { sum += *p++; len -= 2; }
+    if (len) sum += *(const uint8_t *)p;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+static uint16_t tcp_checksum(uint32_t src_ip, uint32_t dst_ip,
+                             const uint8_t *tcp, size_t tcp_len)
+{
+    struct { uint32_t src; uint32_t dst; uint8_t zero; uint8_t proto; uint16_t len; } pseudo;
+    pseudo.src = src_ip;
+    pseudo.dst = dst_ip;
+    pseudo.zero = 0;
+    pseudo.proto = 6;
+    pseudo.len = htons((uint16_t)tcp_len);
+
+    uint32_t sum = 0;
+    const uint16_t *p = (const uint16_t *)&pseudo;
+    for (size_t i = 0; i < sizeof(pseudo) / 2; i++) sum += p[i];
+
+    p = (const uint16_t *)tcp;
+    size_t rem = tcp_len;
+    while (rem > 1) { sum += *p++; rem -= 2; }
+    if (rem) sum += *(const uint8_t *)p;
+
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)~sum;
 }
 
 static void send_arp_request(uint8_t *frame, uint8_t *src_mac, uint8_t *target_ip)
@@ -81,35 +90,220 @@ static void send_arp_request(uint8_t *frame, uint8_t *src_mac, uint8_t *target_i
     memcpy(arp + 24, target_ip, 4);
 }
 
-static void send_tcp_syn(uint8_t *frame, uint8_t *src_mac, uint8_t *dst_mac,
-                       uint32_t src_ip, uint32_t dst_ip,
-                       uint16_t src_port, uint32_t seq)
+static int wait_arp_reply(uint8_t *gateway_mac)
 {
-    memset(frame, 0, 54);
+    for (int attempt = 0; attempt < 5; attempt++) {
+        uint8_t buf[2048];
+        int n = ring_read(&g_rx_ring, buf, sizeof(buf));
+        if (n > 0) {
+            struct ethhdr *eth = (struct ethhdr *)buf;
+            if (ntohs(eth->h_proto) == ETH_P_ARP) {
+                uint8_t *arp = buf + 14;
+                if (arp[6] == 0 && arp[7] == 2) {
+                    memcpy(gateway_mac, arp + 8, 6);
+                    printf("ARP: gateway MAC = %02x:%02x:%02x:%02x:%02x:%02x\n",
+                           gateway_mac[0], gateway_mac[1], gateway_mac[2],
+                           gateway_mac[3], gateway_mac[4], gateway_mac[5]);
+                    return 0;
+                }
+            }
+        }
+        usleep(200000);
+    }
+    return -1;
+}
+
+static size_t build_tcp_frame(uint8_t *frame, size_t sizeof_frame,
+                              uint8_t *src_mac, uint8_t *dst_mac,
+                              uint32_t src_ip, uint32_t dst_ip,
+                              uint16_t src_port, uint16_t dst_port,
+                              uint32_t seq, uint32_t ack,
+                              uint16_t flags,
+                              const uint8_t *payload, size_t plen)
+{
+    size_t tcp_hdr_len = (flags & 0x02) ? 24 : 20;
+    size_t ip_len = 20 + tcp_hdr_len + plen;
+    size_t total = 14 + ip_len;
+
+    memset(frame, 0, total);
+
     struct ethhdr *eth = (struct ethhdr *)frame;
     memcpy(eth->h_dest, dst_mac, 6);
     memcpy(eth->h_source, src_mac, 6);
     eth->h_proto = htons(ETH_P_IP);
 
     uint8_t *ip = frame + 14;
-    ip[0] = 0x45; ip[1] = 0; ip[2] = 0; ip[3] = 0;
-    ip[4] = 0; ip[5] = 0; ip[6] = 0; ip[7] = 0;
-    ip[8] = 64; ip[9] = 6; ip[10] = 0; ip[11] = 0;
+    ip[0] = 0x45; ip[1] = 0;
+    ip[2] = (ip_len >> 8) & 0xFF; ip[3] = ip_len & 0xFF;
+    ip[8] = 64; ip[9] = 6;
     memcpy(ip + 12, &src_ip, 4);
     memcpy(ip + 16, &dst_ip, 4);
-    uint16_t ip_tot = htons(40);
-    memcpy(ip + 2, &ip_tot, 2);
+    ip[10] = 0; ip[11] = 0;
+    uint16_t ipc = checksum16(ip, 20);
+    memcpy(ip + 10, &ipc, 2);
 
     uint8_t *tcp = frame + 34;
-    tcp[0] = (src_port >> 8) & 0xFF;
-    tcp[1] = src_port & 0xFF;
-    tcp[2] = 0; tcp[3] = 80;
-    tcp[4] = (seq >> 24) & 0xFF;
-    tcp[5] = (seq >> 16) & 0xFF;
-    tcp[6] = (seq >> 8) & 0xFF;
-    tcp[7] = seq & 0xFF;
-    tcp[12] = 0x50; tcp[13] = 0x02;
+    tcp[0] = (src_port >> 8) & 0xFF; tcp[1] = src_port & 0xFF;
+    tcp[2] = (dst_port >> 8) & 0xFF; tcp[3] = dst_port & 0xFF;
+    tcp[4] = (seq >> 24) & 0xFF; tcp[5] = (seq >> 16) & 0xFF;
+    tcp[6] = (seq >> 8) & 0xFF; tcp[7] = seq & 0xFF;
+    tcp[8] = (ack >> 24) & 0xFF; tcp[9] = (ack >> 16) & 0xFF;
+    tcp[10] = (ack >> 8) & 0xFF; tcp[11] = ack & 0xFF;
+    tcp[12] = (tcp_hdr_len / 4) << 4;
+    tcp[13] = flags & 0xFF;
     tcp[14] = 0xFF; tcp[15] = 0xFF;
+
+    if (flags & 0x02) {
+        uint8_t *opts = tcp + 20;
+        opts[0] = 2; opts[1] = 4;
+        uint16_t mss = htons(1460);
+        memcpy(&opts[2], &mss, 2);
+    }
+
+    if (payload && plen > 0)
+        memcpy(tcp + tcp_hdr_len, payload, plen);
+
+    uint16_t tc = tcp_checksum(src_ip, dst_ip, tcp, tcp_hdr_len + plen);
+    memcpy(tcp + 16, &tc, 2);
+
+    return total;
+}
+
+static int wait_frame(uint8_t *buf, size_t buflen, uint16_t expected_proto, int timeout_ms)
+{
+    int elapsed = 0;
+    while (elapsed < timeout_ms) {
+        int n = ring_read(&g_rx_ring, buf, buflen);
+        if (n > 0) {
+            struct ethhdr *eth = (struct ethhdr *)buf;
+            if (ntohs(eth->h_proto) == expected_proto)
+                return n;
+        }
+        usleep(10000);
+        elapsed += 10;
+    }
+    return -1;
+}
+
+static int test_tcp(uint8_t *src_mac, uint32_t src_ip, uint8_t *dst_mac,
+                    uint32_t dst_ip, uint16_t dst_port)
+{
+    uint16_t src_port = 40000 + (rand() % 10000);
+    uint32_t seq = 1000;
+    uint32_t ack = 0;
+    uint8_t frame[1514];
+    uint8_t buf[2048];
+
+    printf("\n=== TCP test: %s:%d ===\n", inet_ntoa(*(struct in_addr *)&dst_ip), dst_port);
+
+    /* SYN */
+    printf("1. Sending SYN...\n");
+    size_t len = build_tcp_frame(frame, sizeof(frame),
+                                 src_mac, dst_mac, src_ip, dst_ip,
+                                 src_port, dst_port, seq, 0,
+                                 0x02, NULL, 0);
+    ring_write(&g_tx_ring, frame, (uint16_t)len);
+    ring_notify(&g_tx_ring);
+    seq++;
+
+    /* SYN-ACK */
+    printf("2. Waiting for SYN-ACK...\n");
+    int n = wait_frame(buf, sizeof(buf), ETH_P_IP, 5000);
+    if (n < 0) { printf("   TIMEOUT\n"); return -1; }
+
+    uint8_t *ip = buf + 14;
+    uint8_t *tcp = ip + 20;
+    uint16_t sport = (tcp[0] << 8) | tcp[1];
+    uint32_t srv_seq = ((uint32_t)tcp[4] << 24) | ((uint32_t)tcp[5] << 16)
+                     | ((uint32_t)tcp[6] << 8) | tcp[7];
+    uint32_t srv_ack = ((uint32_t)tcp[8] << 24) | ((uint32_t)tcp[9] << 16)
+                     | ((uint32_t)tcp[10] << 8) | tcp[11];
+    uint8_t flags = tcp[13];
+
+    printf("   sport=0x%04x flags=0x%02x seq=0x%08x ack=0x%08x\n",
+           sport, flags, srv_seq, srv_ack);
+
+    if (!(flags & 0x12)) { printf("   Not SYN-ACK\n"); return -1; }
+    ack = srv_seq + 1;
+    printf("   SYN-ACK received, ack=0x%08x\n", ack);
+
+    /* ACK */
+    printf("3. Sending ACK...\n");
+    len = build_tcp_frame(frame, sizeof(frame),
+                          src_mac, dst_mac, src_ip, dst_ip,
+                          src_port, dst_port, seq, ack,
+                          0x10, NULL, 0);
+    ring_write(&g_tx_ring, frame, (uint16_t)len);
+    ring_notify(&g_tx_ring);
+    printf("   Connection ESTABLISHED\n");
+
+    /* HTTP GET */
+    const char *http = "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n";
+    size_t http_len = strlen(http);
+    printf("4. Sending HTTP GET (%zu bytes)...\n", http_len);
+    len = build_tcp_frame(frame, sizeof(frame),
+                          src_mac, dst_mac, src_ip, dst_ip,
+                          src_port, dst_port, seq, ack,
+                          0x18, (const uint8_t *)http, http_len);
+    ring_write(&g_tx_ring, frame, (uint16_t)len);
+    ring_notify(&g_tx_ring);
+    seq += http_len;
+
+    /* Read response */
+    printf("5. Waiting for response...\n");
+    int total = 0;
+    for (int i = 0; i < 50; i++) {
+        n = ring_read(&g_rx_ring, buf, sizeof(buf));
+        if (n > 0) {
+            struct ethhdr *eth = (struct ethhdr *)buf;
+            if (ntohs(eth->h_proto) != ETH_P_IP) continue;
+
+            uint8_t *tip = buf + 14;
+            uint8_t *ttcp = tip + 20;
+            uint8_t tflags = ttcp[13];
+            size_t tcp_hlen = (ttcp[12] >> 4) * 4;
+            size_t ip_totlen = (tip[2] << 8) | tip[3];
+            size_t payload_len = ip_totlen - 20 - tcp_hlen;
+
+            if (tflags & 0x01) {
+                printf("   FIN received\n");
+                uint32_t fin_seq = ((uint32_t)ttcp[4] << 24) | ((uint32_t)ttcp[5] << 16)
+                                 | ((uint32_t)ttcp[6] << 8) | ttcp[7];
+                uint32_t fin_ack = ((uint32_t)ttcp[8] << 24) | ((uint32_t)ttcp[9] << 16)
+                                 | ((uint32_t)ttcp[10] << 8) | ttcp[11];
+                len = build_tcp_frame(frame, sizeof(frame),
+                                      src_mac, dst_mac, src_ip, dst_ip,
+                                      src_port, dst_port, seq, fin_seq + 1,
+                                      0x10, NULL, 0);
+                ring_write(&g_tx_ring, frame, (uint16_t)len);
+                ring_notify(&g_tx_ring);
+                break;
+            }
+
+            if (payload_len > 0) {
+                uint8_t *payload = ttcp + tcp_hlen;
+                if (total == 0) {
+                    printf("   Got %zu bytes of data:\n", payload_len);
+                    size_t show = payload_len < 200 ? payload_len : 200;
+                    printf("   ---\n   %.*s\n   ---\n", (int)show, payload);
+                }
+                total += payload_len;
+                uint32_t fin_seq = ((uint32_t)ttcp[4] << 24) | ((uint32_t)ttcp[5] << 16)
+                                 | ((uint32_t)ttcp[6] << 8) | ttcp[7];
+                len = build_tcp_frame(frame, sizeof(frame),
+                                      src_mac, dst_mac, src_ip, dst_ip,
+                                      src_port, dst_port, seq, fin_seq + payload_len,
+                                      0x10, NULL, 0);
+                ring_write(&g_tx_ring, frame, (uint16_t)len);
+                ring_notify(&g_tx_ring);
+            }
+        }
+        usleep(50000);
+    }
+
+    printf("   Total received: %d bytes\n", total);
+    printf("=== TCP test %s ===\n", total > 0 ? "PASSED" : "FAILED");
+    return total > 0 ? 0 : -1;
 }
 
 int main(int argc, char *argv[])
@@ -130,7 +324,6 @@ int main(int argc, char *argv[])
     }
     printf("Connected to mini-vpnkit\n");
 
-    /* Receive two eventfds from server (order: rx_efd then tx_efd) */
     int rx_efd = recv_one_fd(sock);
     int tx_efd = recv_one_fd(sock);
     printf("Received eventfds: rx=%d tx=%d\n", rx_efd, tx_efd);
@@ -139,45 +332,34 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Failed to receive eventfds\n");
         close(sock); return 1;
     }
-
     close(sock);
 
-    /*
-     * Attach to rings:
-     *   g_tx_ring → /vpnkit-rx (client writes requests here, eventfd=rx_efd)
-     *   g_rx_ring → /vpnkit-tx (client reads replies here, eventfd=tx_efd)
-     */
     ring_attach(&g_tx_ring, "/vpnkit-rx", rx_efd);
     ring_attach(&g_rx_ring, "/vpnkit-tx", tx_efd);
 
-    printf("g_tx_ring → /vpnkit-rx (efd=%d), g_rx_ring → /vpnkit-tx (efd=%d)\n",
-           ring_event_fd(&g_tx_ring), ring_event_fd(&g_rx_ring));
-
     uint8_t src_mac[6] = {0x02, rand()&0xFF, rand()&0xFF, rand()&0xFF, rand()&0xFF, 1};
-    uint32_t src_ip = (10 << 24) | (0 << 16) | (2 << 8) | (100);
+    uint32_t src_ip = (10 << 24) | (0 << 16) | (2 << 8) | 100;
 
-    uint8_t frame[128];
+    /* ARP: resolve gateway MAC */
+    printf("\n--- ARP ---\n");
+    uint8_t frame[1514];
+    uint8_t gateway_mac[6];
+
     send_arp_request(frame, src_mac, (uint8_t *)GATEWAY_IP);
     ring_write(&g_tx_ring, frame, 60);
     ring_notify(&g_tx_ring);
-    printf("Sent ARP request (notified via /vpnkit-rx eventfd %d)\n",
-           ring_event_fd(&g_tx_ring));
+    printf("Sent ARP request\n");
 
-    usleep(200000);
-
-    int replies = 0;
-    while (replies < 3) {
-        uint8_t buf[2048];
-        int n = ring_read(&g_rx_ring, buf, sizeof(buf));
-        if (n > 0) {
-            replies++;
-            struct ethhdr *eth = (struct ethhdr *)buf;
-            printf("Reply #%d: type=0x%04x\n", replies, ntohs(eth->h_proto));
-        }
-        sleep(1);
+    if (wait_arp_reply(gateway_mac) < 0) {
+        fprintf(stderr, "ARP failed\n");
+        ring_destroy(&g_rx_ring, "/vpnkit-tx");
+        ring_destroy(&g_tx_ring, "/vpnkit-rx");
+        return 1;
     }
 
-    printf("Test complete, %d replies received\n", replies);
+    /* TCP: connect to example.com:80 */
+    uint32_t dst_ip = (93 << 24) | (184 << 16) | (216 << 8) | 34;
+    test_tcp(src_mac, src_ip, gateway_mac, dst_ip, 80);
 
     ring_destroy(&g_rx_ring, "/vpnkit-tx");
     ring_destroy(&g_tx_ring, "/vpnkit-rx");
