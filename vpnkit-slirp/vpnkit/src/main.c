@@ -18,6 +18,7 @@
 static ring_t g_rx_ring;
 static ring_t g_tx_ring;
 static conn_table_t g_conn_table;
+static udp_conn_table_t g_udp_table;
 static portfwd_server_t g_portfwd;
 
 static void usage(const char *prog)
@@ -100,6 +101,7 @@ int main(int argc, char *argv[])
     }
 
     conn_table_init(&g_conn_table);
+    udp_table_init(&g_udp_table);
 
     if (ring_create(&g_rx_ring, "/vpnkit-rx") < 0) {
         fprintf(stderr, "Failed to create rx ring\n");
@@ -162,12 +164,13 @@ int main(int argc, char *argv[])
                         if (proto == 6)
                             tcp_handle(frame, n, &g_conn_table, &g_tx_ring);
                         else if (proto == 17)
-                            udp_handle(frame, n, &g_conn_table, &g_tx_ring);
+                            udp_handle(frame, n, &g_conn_table, &g_tx_ring, &g_udp_table);
                     }
                 }
             }
         }
         tcp_poll_host(&g_conn_table, &g_tx_ring);
+        udp_poll(&g_udp_table, &g_tx_ring);
         if (portfwd_path && (pfds[2].revents & POLLIN))
             portfwd_handle_new(&g_portfwd);
         if (portfwd_path)

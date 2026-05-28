@@ -97,17 +97,19 @@ static void send_tcp_syn(uint8_t *frame, uint8_t *src_mac, uint8_t *dst_mac,
     ip[8] = 64; ip[9] = 6; ip[10] = 0; ip[11] = 0;
     memcpy(ip + 12, &src_ip, 4);
     memcpy(ip + 16, &dst_ip, 4);
+    uint16_t ip_tot = htons(40);
+    memcpy(ip + 2, &ip_tot, 2);
 
     uint8_t *tcp = frame + 34;
     tcp[0] = (src_port >> 8) & 0xFF;
     tcp[1] = src_port & 0xFF;
+    tcp[2] = 0; tcp[3] = 80;
     tcp[4] = (seq >> 24) & 0xFF;
     tcp[5] = (seq >> 16) & 0xFF;
     tcp[6] = (seq >> 8) & 0xFF;
     tcp[7] = seq & 0xFF;
     tcp[12] = 0x50; tcp[13] = 0x02;
     tcp[14] = 0xFF; tcp[15] = 0xFF;
-    tcp[8] = 0x02;
 }
 
 int main(int argc, char *argv[])
