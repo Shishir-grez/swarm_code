@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -109,20 +110,34 @@ void tcp_handle(const uint8_t *frame, size_t frame_len,
         c->snd_nxt = c->my_isn + 1;
         c->state = CONN_SYN_RCVD;
 
-        uint8_t syn_ack_frame[1514];
-        size_t sa_len = build_tcp_frame(
-            syn_ack_frame, sizeof(syn_ack_frame),
-            c->guest_mac, GATEWAY_MAC,
-            dst_ip, src_ip,
-            dst_port, src_port,
-            c->my_isn, c->rcv_nxt,
-            TH_SYN | TH_ACK, NULL, 0
-        );
-
-        ring_write(tx_ring, syn_ack_frame, (uint16_t)sa_len);
-        ring_notify(tx_ring);
-
-        printf("TCP: SYN -> connect() -> SYN-ACK\n");
+        if (ret == 0) {
+            c->connect_in_progress = 0;
+            uint8_t syn_ack_frame[1514];
+            size_t sa_len = build_tcp_frame(
+                syn_ack_frame, sizeof(syn_ack_frame),
+                c->guest_mac, GATEWAY_MAC,
+                dst_ip, src_ip,
+                dst_port, src_port,
+                c->my_isn, c->rcv_nxt,
+                TH_SYN | TH_ACK, NULL, 0
+            );
+            ring_write(tx_ring, syn_ack_frame, (uint16_t)sa_len);
+            ring_notify(tx_ring);
+            printf("TCP: SYN -> connect() instant success -> SYN-ACK\n");
+        } else {
+            c->connect_in_progress = 1;
+            int soerr = 0;
+            socklen_t slen = sizeof(soerr);
+            getsockopt(c->host_fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+            if (soerr != 0) {
+                c->my_isn = generate_isn();
+                c->snd_nxt = c->my_isn;
+                send_to_guest(tx_ring, c, TH_RST | TH_ACK, NULL, 0);
+                conn_remove(ct, c);
+                return;
+            }
+            printf("TCP: SYN -> connect() EINPROGRESS, waiting...\n");
+        }
         return;
     }
 
@@ -131,7 +146,7 @@ void tcp_handle(const uint8_t *frame, size_t frame_len,
 
     c->last_active = time(NULL);
 
-    if (tcp->ack && c->state == CONN_SYN_RCVD) {
+    if (tcp->ack && c->state == CONN_SYN_RCVD && !c->connect_in_progress) {
         c->state = CONN_ESTABLISHED;
         printf("TCP: connection ESTABLISHED\n");
     }
@@ -166,8 +181,40 @@ void tcp_poll_host(conn_table_t *ct, ring_t *tx_ring)
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         conn_t *c = &ct->entries[i];
-        if (c->state != CONN_ESTABLISHED || c->host_fd < 0)
+        if (c->host_fd < 0) continue;
+
+        if (c->state == CONN_SYN_RCVD && c->connect_in_progress) {
+            struct pollfd pfd = { .fd = c->host_fd, .events = POLLOUT };
+            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLOUT | POLLERR | POLLHUP))) {
+                int soerr = 0;
+                socklen_t slen = sizeof(soerr);
+                getsockopt(c->host_fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+                if (soerr != 0) {
+                    c->my_isn = generate_isn();
+                    c->snd_nxt = c->my_isn;
+                    send_to_guest(tx_ring, c, TH_RST | TH_ACK, NULL, 0);
+                    conn_remove(ct, c);
+                    printf("TCP: connect() failed: %s\n", strerror(soerr));
+                } else {
+                    c->connect_in_progress = 0;
+                    uint8_t syn_ack_frame[1514];
+                    size_t sa_len = build_tcp_frame(
+                        syn_ack_frame, sizeof(syn_ack_frame),
+                        c->guest_mac, GATEWAY_MAC,
+                        c->guest_dst_ip, c->guest_src_ip,
+                        c->guest_dst_port, c->guest_src_port,
+                        c->my_isn, c->rcv_nxt,
+                        TH_SYN | TH_ACK, NULL, 0
+                    );
+                    ring_write(tx_ring, syn_ack_frame, (uint16_t)sa_len);
+                    ring_notify(tx_ring);
+                    printf("TCP: connect() completed -> SYN-ACK\n");
+                }
+            }
             continue;
+        }
+
+        if (c->state != CONN_ESTABLISHED) continue;
 
         ssize_t n = recv(c->host_fd, buf, sizeof(buf), MSG_DONTWAIT);
 

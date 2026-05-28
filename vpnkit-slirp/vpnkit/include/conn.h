@@ -27,6 +27,7 @@ typedef struct {
     uint32_t snd_nxt;
     uint32_t rcv_nxt;
     int      host_fd;
+    int      connect_in_progress;
     time_t   last_active;
 } conn_t;
 

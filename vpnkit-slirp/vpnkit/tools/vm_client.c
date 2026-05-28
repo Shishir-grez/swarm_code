@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,46 +17,49 @@ static const uint8_t GATEWAY_IP[4] = {10, 0, 2, 2};
 static ring_t g_rx_ring;
 static ring_t g_tx_ring;
 
-// Receive two file descriptors via Unix socket using SCM_RIGHTS
-static int recv_fds(int sock, int *fd1, int *fd2)
-{
-    struct msghdr msg = {0};
-    struct iovec iov;
-    char buf[CMSG_SPACE(2 * sizeof(int))];
-    char dummy;
+/*
+ * Ring direction map:
+ *   /vpnkit-rx: server READS here, client WRITES here (g_tx_ring)
+ *   /vpnkit-tx: server WRITES here, client READS here (g_rx_ring)
+ *
+ * Server sends FDs one at a time:
+ *   FD #1 = rx ring's eventfd (used by client when writing to rx ring)
+ *   FD #2 = tx ring's eventfd (used by server when writing to tx ring)
+ *
+ * Client receives them in same order and attaches accordingly.
+ */
 
-    iov.iov_base = &dummy;
-    iov.iov_len = 1;
+/* Receive one FD from server via SCM_RIGHTS on a connected Unix socket */
+static int recv_one_fd(int sock)
+{
+    char dummy;
+    struct iovec iov = { .iov_base = &dummy, .iov_len = 1 };
+
+    /*
+     * Use CMSG_SPACE(sizeof(int)*2) for buffer to handle kernel
+     * alignment padding — some kernels use 16-byte alignment for
+     * the cmsg buffer even for a single int.
+     */
+    char cbuf[CMSG_SPACE(sizeof(int) * 2)];
+    struct msghdr msg = {0};
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof(cbuf);
 
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-
-    if (recvmsg(sock, &msg, 0) < 0)
+    if (recvmsg(sock, &msg, 0) < 0) {
+        perror("recvmsg");
         return -1;
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-        int *fds = (int *)CMSG_DATA(cmsg);
-        *fd1 = fds[0];
-        *fd2 = fds[1];
-        return 0;
     }
 
-    return -1;
-}
-
-// Read exact N bytes from socket
-static int recv_exact(int sock, void *buf, size_t len)
-{
-    size_t received = 0;
-    while (received < len) {
-        ssize_t n = read(sock, (char *)buf + received, len - received);
-        if (n <= 0) return -1;
-        received += (size_t)n;
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    if (!cm || cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) {
+        fprintf(stderr, "ERROR: no SCM_RIGHTS in message\n");
+        return -1;
     }
-    return 0;
+
+    int *fds = (int *)CMSG_DATA(cm);
+    return fds[0];
 }
 
 static void send_arp_request(uint8_t *frame, uint8_t *src_mac, uint8_t *target_ip)
@@ -108,64 +112,44 @@ static void send_tcp_syn(uint8_t *frame, uint8_t *src_mac, uint8_t *dst_mac,
 
 int main(int argc, char *argv[])
 {
-    srand(time(NULL));
+    srand((unsigned)time(NULL));
 
     printf("VM client starting...\n");
 
-    // Connect to mini-vpnkit's Unix socket
-    const char *sock_path = "/tmp/vpnkit.sock";
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return 1; }
 
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, "/tmp/vpnkit.sock", sizeof(addr.sun_path) - 1);
 
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("connect"); close(sock); return 1;
     }
     printf("Connected to mini-vpnkit\n");
 
-    // Receive eventfds from server via SCM_RIGHTS
-    int rx_efd, tx_efd;
-    if (recv_fds(sock, &rx_efd, &tx_efd) < 0) {
-        fprintf(stderr, "Failed to receive eventfds\n");
-        return 1;
-    }
+    /* Receive two eventfds from server (order: rx_efd then tx_efd) */
+    int rx_efd = recv_one_fd(sock);
+    int tx_efd = recv_one_fd(sock);
     printf("Received eventfds: rx=%d tx=%d\n", rx_efd, tx_efd);
 
-    // Receive shared memory names
-    uint32_t rx_len, tx_len;
-    char rx_shm[256], tx_shm[256];
-    if (recv_exact(sock, &rx_len, 4) < 0 ||
-        recv_exact(sock, rx_shm, rx_len) < 0 ||
-        recv_exact(sock, &tx_len, 4) < 0 ||
-        recv_exact(sock, tx_shm, tx_len) < 0) {
-        fprintf(stderr, "Failed to receive shm names\n");
-        return 1;
+    if (rx_efd < 0 || tx_efd < 0) {
+        fprintf(stderr, "Failed to receive eventfds\n");
+        close(sock); return 1;
     }
-    rx_shm[rx_len] = '\0';
-    tx_shm[tx_len] = '\0';
-    printf("RX ring: %s, TX ring: %s\n", rx_shm, tx_shm);
 
-    close(sock); // No longer needed after receiving everything
+    close(sock);
 
-    // Attach to shared memory rings with the server's eventfds
-    // Direction convention:
-    //   rx_shm = /vpnkit-rx: server READS from here (client WRITES here = g_tx_ring)
-    //   tx_shm = /vpnkit-tx: server WRITES to here (client READS here = g_rx_ring)
-    // Eventfd naming from server's perspective:
-    //   rx_shm comes with rx_efd (server polls this for incoming data)
-    //   tx_shm comes with tx_efd (server polls this for outgoing data)
-    // Client writes to rx_shm and notifies via rx_efd → server wakes up
-    // Client reads from tx_shm and notifies via tx_efd → server wakes up
-    ring_attach(&g_tx_ring, rx_shm, rx_efd);  // write requests → notify rx_efd
-    ring_attach(&g_rx_ring, tx_shm, tx_efd);  // read replies → notify tx_efd
+    /*
+     * Attach to rings:
+     *   g_tx_ring → /vpnkit-rx (client writes requests here, eventfd=rx_efd)
+     *   g_rx_ring → /vpnkit-tx (client reads replies here, eventfd=tx_efd)
+     */
+    ring_attach(&g_tx_ring, "/vpnkit-rx", rx_efd);
+    ring_attach(&g_rx_ring, "/vpnkit-tx", tx_efd);
 
-    printf("Client: g_tx_ring eventfd=%d (should be rx_efd=%d, /vpnkit-rx notifier)\n",
-           ring_event_fd(&g_tx_ring), rx_efd);
-    printf("Client: g_rx_ring eventfd=%d (should be tx_efd=%d, /vpnkit-tx notifier)\n",
-           ring_event_fd(&g_rx_ring), tx_efd);
+    printf("g_tx_ring → /vpnkit-rx (efd=%d), g_rx_ring → /vpnkit-tx (efd=%d)\n",
+           ring_event_fd(&g_tx_ring), ring_event_fd(&g_rx_ring));
 
     uint8_t src_mac[6] = {0x02, rand()&0xFF, rand()&0xFF, rand()&0xFF, rand()&0xFF, 1};
     uint32_t src_ip = (10 << 24) | (0 << 16) | (2 << 8) | (100);
@@ -174,21 +158,26 @@ int main(int argc, char *argv[])
     send_arp_request(frame, src_mac, (uint8_t *)GATEWAY_IP);
     ring_write(&g_tx_ring, frame, 60);
     ring_notify(&g_tx_ring);
-    printf("Sent ARP request to ring %p (notified via eventfd %d)\n", (void*)&g_tx_ring, g_tx_ring.event_fd);
+    printf("Sent ARP request (notified via /vpnkit-rx eventfd %d)\n",
+           ring_event_fd(&g_tx_ring));
 
-    usleep(100000);
+    usleep(200000);
 
-    while (1) {
+    int replies = 0;
+    while (replies < 3) {
         uint8_t buf[2048];
         int n = ring_read(&g_rx_ring, buf, sizeof(buf));
         if (n > 0) {
+            replies++;
             struct ethhdr *eth = (struct ethhdr *)buf;
-            printf("Received frame: type=0x%04x\n", ntohs(eth->h_proto));
+            printf("Reply #%d: type=0x%04x\n", replies, ntohs(eth->h_proto));
         }
         sleep(1);
     }
 
-    ring_destroy(&g_rx_ring, tx_shm);
-    ring_destroy(&g_tx_ring, rx_shm);
+    printf("Test complete, %d replies received\n", replies);
+
+    ring_destroy(&g_rx_ring, "/vpnkit-tx");
+    ring_destroy(&g_tx_ring, "/vpnkit-rx");
     return 0;
 }
