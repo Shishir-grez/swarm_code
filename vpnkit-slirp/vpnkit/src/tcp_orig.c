@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -82,7 +83,7 @@ void tcp_handle(const uint8_t *frame, size_t frame_len,
         c->guest_isn = seq;
         c->rcv_nxt = seq + 1;
 
-        c->host_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        c->host_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (c->host_fd < 0) {
             c->my_isn = generate_isn();
             c->snd_nxt = c->my_isn;
@@ -96,6 +97,9 @@ void tcp_handle(const uint8_t *frame, size_t frame_len,
         dest.sin_family = AF_INET;
         dest.sin_addr.s_addr = dst_ip;
         dest.sin_port = htons(dst_port);
+
+        int flags = fcntl(c->host_fd, F_GETFL, 0);
+        fcntl(c->host_fd, F_SETFL, flags | O_NONBLOCK);
 
         int ret = connect(c->host_fd, (struct sockaddr *)&dest, sizeof(dest));
         if (ret < 0 && errno != EINPROGRESS) {
@@ -123,21 +127,43 @@ void tcp_handle(const uint8_t *frame, size_t frame_len,
             );
             ring_write(tx_ring, syn_ack_frame, (uint16_t)sa_len);
             ring_notify(tx_ring);
-            printf("TCP: SYN -> connect() instant success -> SYN-ACK\n");
+            printf("TCP: SYN -> connect() instant -> SYN-ACK\n");
         } else {
-            c->connect_in_progress = 1;
-            int soerr = 0;
-            socklen_t slen = sizeof(soerr);
-            getsockopt(c->host_fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
-            if (soerr != 0) {
-                c->my_isn = generate_isn();
-                c->snd_nxt = c->my_isn;
-                send_to_guest(tx_ring, c, TH_RST | TH_ACK, NULL, 0);
-                conn_remove(ct, c);
-                return;
+            struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(c->host_fd, &wfds);
+
+            ret = select(c->host_fd + 1, NULL, &wfds, NULL, &tv);
+            if (ret > 0) {
+                int soerr = 0;
+                socklen_t slen = sizeof(soerr);
+                getsockopt(c->host_fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+                if (soerr != 0) {
+                    printf("TCP: connect() failed: %s\n", strerror(soerr));
+                    c->my_isn = generate_isn();
+                    c->snd_nxt = c->my_isn;
+                    send_to_guest(tx_ring, c, TH_RST | TH_ACK, NULL, 0);
+                    conn_remove(ct, c);
+                    return;
+                }
+                c->connect_in_progress = 0;
+                uint8_t syn_ack_frame[1514];
+                size_t sa_len = build_tcp_frame(
+                    syn_ack_frame, sizeof(syn_ack_frame),
+                    c->guest_mac, GATEWAY_MAC,
+                    dst_ip, src_ip,
+                    dst_port, src_port,
+                    c->my_isn, c->rcv_nxt,
+                    TH_SYN | TH_ACK, NULL, 0
+                );
+                ring_write(tx_ring, syn_ack_frame, (uint16_t)sa_len);
+                ring_notify(tx_ring);
+                printf("TCP: SYN -> select() -> connect done -> SYN-ACK (%zu bytes)\n", sa_len);
+            } else {
+                c->connect_in_progress = 1;
+                printf("TCP: SYN -> select() timeout, deferring SYN-ACK\n");
             }
-            printf("TCP: SYN -> connect() EINPROGRESS, waiting... (slot=%d host_fd=%d)\n",
-                   (int)(c - ct->entries), c->host_fd);
         }
         return;
     }
