@@ -223,7 +223,7 @@ static int test_tcp(uint8_t *src_mac, uint32_t src_ip, uint8_t *dst_mac,
     printf("   sport=0x%04x flags=0x%02x seq=0x%08x ack=0x%08x\n",
            sport, flags, srv_seq, srv_ack);
 
-    if (!(flags & 0x12)) { printf("   Not SYN-ACK\n"); return -1; }
+    if ((flags & 0x12) != 0x12) { printf("   Not SYN-ACK (flags=0x%02x)\n", flags); return -1; }
     ack = srv_seq + 1;
     printf("   SYN-ACK received, ack=0x%08x\n", ack);
 
@@ -357,9 +357,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* TCP: connect to localhost:80 (simple HTTP server) */
+    /* TCP: connect to localhost:8080 (simple HTTP server) */
     uint32_t dst_ip = inet_addr("127.0.0.1");
-    test_tcp(src_mac, src_ip, gateway_mac, dst_ip, 80);
+    test_tcp(src_mac, src_ip, gateway_mac, dst_ip, 8080);
 
     ring_destroy(&g_rx_ring, "/vpnkit-tx");
     ring_destroy(&g_tx_ring, "/vpnkit-rx");
