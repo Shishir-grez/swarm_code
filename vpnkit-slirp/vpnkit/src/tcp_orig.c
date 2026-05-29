@@ -213,13 +213,10 @@ void tcp_poll_host(conn_table_t *ct, ring_t *tx_ring)
         if (c->state == CONN_SYN_RCVD && c->connect_in_progress) {
             struct pollfd pfd = { .fd = c->host_fd, .events = POLLOUT };
             int pret = poll(&pfd, 1, 0);
-            printf("TCP_POLL: slot=%d host_fd=%d poll=%d revents=0x%02x\n",
-                   i, c->host_fd, pret, pfd.revents);
             if (pret > 0 && (pfd.revents & (POLLOUT | POLLERR | POLLHUP))) {
                 int soerr = 0;
                 socklen_t slen = sizeof(soerr);
                 getsockopt(c->host_fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
-                printf("TCP_POLL: soerr=%d\n", soerr);
                 if (soerr != 0) {
                     c->my_isn = generate_isn();
                     c->snd_nxt = c->my_isn;

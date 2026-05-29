@@ -338,7 +338,7 @@ int main(int argc, char *argv[])
     ring_attach(&g_rx_ring, "/vpnkit-tx", tx_efd);
 
     uint8_t src_mac[6] = {0x02, rand()&0xFF, rand()&0xFF, rand()&0xFF, rand()&0xFF, 1};
-    uint32_t src_ip = (10 << 24) | (0 << 16) | (2 << 8) | 100;
+    uint32_t src_ip = htonl((10 << 24) | (0 << 16) | (2 << 8) | 100);
 
     /* ARP: resolve gateway MAC */
     printf("\n--- ARP ---\n");
@@ -358,7 +358,7 @@ int main(int argc, char *argv[])
     }
 
     /* TCP: connect to example.com:80 */
-    uint32_t dst_ip = (93 << 24) | (184 << 16) | (216 << 8) | 34;
+    uint32_t dst_ip = htonl((93 << 24) | (184 << 16) | (216 << 8) | 34);
     test_tcp(src_mac, src_ip, gateway_mac, dst_ip, 80);
 
     ring_destroy(&g_rx_ring, "/vpnkit-tx");
