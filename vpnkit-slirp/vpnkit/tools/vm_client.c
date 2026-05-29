@@ -357,8 +357,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* TCP: connect to example.com:80 */
-    uint32_t dst_ip = htonl((93 << 24) | (184 << 16) | (216 << 8) | 34);
+    /* TCP: connect to localhost:80 (simple HTTP server) */
+    uint32_t dst_ip = inet_addr("127.0.0.1");
     test_tcp(src_mac, src_ip, gateway_mac, dst_ip, 80);
 
     ring_destroy(&g_rx_ring, "/vpnkit-tx");
