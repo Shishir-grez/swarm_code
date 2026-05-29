@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <linux/if_ether.h>
 #include "conn.h"
 #include "ring.h"
@@ -98,11 +99,18 @@ void tcp_handle(const uint8_t *frame, size_t frame_len,
         dest.sin_addr.s_addr = dst_ip;
         dest.sin_port = htons(dst_port);
 
-        int flags = fcntl(c->host_fd, F_GETFL, 0);
-        fcntl(c->host_fd, F_SETFL, flags | O_NONBLOCK);
+        char dst_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &dest.sin_addr, dst_str, sizeof(dst_str));
+        printf("TCP: connecting to %s:%d ...\n", dst_str, ntohs(dest.sin_port));
+
+        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(c->host_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         int ret = connect(c->host_fd, (struct sockaddr *)&dest, sizeof(dest));
-        if (ret < 0 && errno != EINPROGRESS) {
+        printf("TCP: connect() returned %d, errno=%d (%s)\n",
+               ret, errno, ret < 0 ? strerror(errno) : "success");
+
+        if (ret < 0) {
             c->my_isn = generate_isn();
             c->snd_nxt = c->my_isn;
             send_to_guest(tx_ring, c, TH_RST | TH_ACK, NULL, 0);
@@ -113,58 +121,20 @@ void tcp_handle(const uint8_t *frame, size_t frame_len,
         c->my_isn = generate_isn();
         c->snd_nxt = c->my_isn + 1;
         c->state = CONN_SYN_RCVD;
+        c->connect_in_progress = 0;
 
-        if (ret == 0) {
-            c->connect_in_progress = 0;
-            uint8_t syn_ack_frame[1514];
-            size_t sa_len = build_tcp_frame(
-                syn_ack_frame, sizeof(syn_ack_frame),
-                c->guest_mac, GATEWAY_MAC,
-                dst_ip, src_ip,
-                dst_port, src_port,
-                c->my_isn, c->rcv_nxt,
-                TH_SYN | TH_ACK, NULL, 0
-            );
-            ring_write(tx_ring, syn_ack_frame, (uint16_t)sa_len);
-            ring_notify(tx_ring);
-            printf("TCP: SYN -> connect() instant -> SYN-ACK\n");
-        } else {
-            struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
-            fd_set wfds;
-            FD_ZERO(&wfds);
-            FD_SET(c->host_fd, &wfds);
-
-            ret = select(c->host_fd + 1, NULL, &wfds, NULL, &tv);
-            if (ret > 0) {
-                int soerr = 0;
-                socklen_t slen = sizeof(soerr);
-                getsockopt(c->host_fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
-                if (soerr != 0) {
-                    printf("TCP: connect() failed: %s\n", strerror(soerr));
-                    c->my_isn = generate_isn();
-                    c->snd_nxt = c->my_isn;
-                    send_to_guest(tx_ring, c, TH_RST | TH_ACK, NULL, 0);
-                    conn_remove(ct, c);
-                    return;
-                }
-                c->connect_in_progress = 0;
-                uint8_t syn_ack_frame[1514];
-                size_t sa_len = build_tcp_frame(
-                    syn_ack_frame, sizeof(syn_ack_frame),
-                    c->guest_mac, GATEWAY_MAC,
-                    dst_ip, src_ip,
-                    dst_port, src_port,
-                    c->my_isn, c->rcv_nxt,
-                    TH_SYN | TH_ACK, NULL, 0
-                );
-                ring_write(tx_ring, syn_ack_frame, (uint16_t)sa_len);
-                ring_notify(tx_ring);
-                printf("TCP: SYN -> select() -> connect done -> SYN-ACK (%zu bytes)\n", sa_len);
-            } else {
-                c->connect_in_progress = 1;
-                printf("TCP: SYN -> select() timeout, deferring SYN-ACK\n");
-            }
-        }
+        uint8_t syn_ack_frame[1514];
+        size_t sa_len = build_tcp_frame(
+            syn_ack_frame, sizeof(syn_ack_frame),
+            c->guest_mac, GATEWAY_MAC,
+            dst_ip, src_ip,
+            dst_port, src_port,
+            c->my_isn, c->rcv_nxt,
+            TH_SYN | TH_ACK, NULL, 0
+        );
+        ring_write(tx_ring, syn_ack_frame, (uint16_t)sa_len);
+        ring_notify(tx_ring);
+        printf("TCP: SYN -> connect() -> SYN-ACK sent (%zu bytes)\n", sa_len);
         return;
     }
 
